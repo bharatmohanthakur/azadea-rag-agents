@@ -1,0 +1,90 @@
+2026-02-06 16:11:13 | INFO | RAG-Server | 📁 Logging to file: /home/admincsp/graphiti_fixed_test/logs/rag_server.log
+2026-02-06 16:11:13 | INFO | RAG-Server | GeneralQueryHandler initialized
+/home/admincsp/graphiti_fixed_test/rag_server_gemini.py:5065: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("shutdown")
+INFO:     Started server process [1999442]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:7868 (Press CTRL+C to quit)
+2026-02-06 16:11:23 | INFO | RAG-Server | 🔗 Connecting to Neo4j: bolt://localhost:7687 (database: neo4j)
+2026-02-06 16:11:23 | INFO | RAG-Server | ✅ Graphiti memory system initialized (database: neo4j)
+🔄 Initializing Graphiti memory system...
+INFO:     127.0.0.1:55100 - "GET /health HTTP/1.1" 200 OK
+2026-02-06 16:11:33 | INFO | RAG-Server | [e4adeeff] 🤖 QUERY_START | {"query": "How can I extend my maternity leave in UAE?"}
+2026-02-06 16:11:34 | INFO | RAG-Server | 🧠 Graphiti search returned 0 facts (group_id=test_user_123)
+2026-02-06 16:11:34 | INFO | RAG-Server | 📦 Prefetched 0 Graphiti facts for user=test_user_123
+2026-02-06 16:11:34 | INFO | RAG-Server | ⏱️ TIMING: Graphiti prefetch took 888ms, 0 facts
+2026-02-06 16:11:34 | INFO | RAG-Server | 🚀 Enhanced query with Graphiti: 0 related facts
+2026-02-06 16:11:34 | INFO | RAG-Server | 🚀 Graphiti context: profile=False, related=0
+2026-02-06 16:11:37 | INFO | RAG-Server | 👤 User profile for test_user_123: UserProfile(user_id='test_user_123', role=None, country='UAE', department=None, brand=None, employment_type=None, preferred_detail_level='medium', interaction_style='neutral', topics_discussed=[], last_updated='2026-02-06T16:11:37.689402', conversation_count=0)
+2026-02-06 16:11:37 | INFO | RAG-Server | 🎯 Conversation state: answering
+2026-02-06 16:11:40 | INFO | RAG-Server | Query classified as knowledge_based (confidence: 0.95): The user is asking a specific question about extending maternity leave in a particular region (UAE), which directly relates to HR policy and requires factual information retrieval.
+2026-02-06 16:11:40 | INFO | RAG-Server | Passing to RAG pipeline: knowledge_based (confidence: 0.95)
+2026-02-06 16:11:40 | INFO | RAG-Server | [e4adeeff] 🤖 DEEP_AGENT_START | {"query": "How can I extend my maternity leave in UAE?"}
+2026-02-06 16:11:47 | INFO | RAG-Server | 🧠 LLM Greeting Detection: is_greeting=False, type=question (reasoning: 1. IDENTIFY QUERY TYPE: The user is asking for information, so it is a question.
+2. ASSESS COMPLEXIT)
+2026-02-06 16:12:01 | INFO | RAG-Server | 🧠 Decomposition Analysis: needs_decomposition=False, reasoning=The query asks a single, cohesive question about extending maternity leave in the UAE. While there might be multiple ways to extend it, the core inten...
+2026-02-06 16:12:01 | INFO | RAG-Server | 📌 Query not decomposable or empty sub-queries - using original query as single sub-query
+2026-02-06 16:12:01 | INFO | RAG-Server | Executing 1 sub-queries in parallel
+2026-02-06 16:12:02 | INFO | RAG-Server | 🔍 Starting parallel Qdrant + Graphiti search for query: How can I extend my maternity leave in UAE?
+2026-02-06 16:12:02 | INFO | RAG-Server | ✅ Qdrant search completed: 10 points found
+2026-02-06 16:12:03 | INFO | RAG-Server | 🧠 Graphiti search returned 0 facts (group_id=test_user_123)
+2026-02-06 16:12:03 | INFO | RAG-Server | ✅ Graphiti search completed: 0 facts found
+2026-02-06 16:12:06 | INFO | RAG-Server | Applied reranking: 10 documents reranked
+2026-02-06 16:12:06 | INFO | RAG-Server | 📚 Retrieving complete documents for top 1 ranked documents in parallel
+2026-02-06 16:12:06 | INFO | RAG-Server | 📄 Loaded complete document 'HRD - GEN - 004 - Maternity and Paternity Leaves - P - 13.md': 10618 chars from /home/admincsp/multimodal-rag/azadea/md_out_data_multimodal/HRD - GEN - 004 - Maternity and Paternity Leaves - P - 13.md
+2026-02-06 16:12:06 | INFO | RAG-Server | ✅ Added complete documents context: 10708 chars from 1 documents
+2026-02-06 16:12:06 | INFO | RAG-Server | ⏱️ RETRIEVAL_TIMING: embed=1.196s, parallel_search=0.815s, rerank=3.060s, complete_docs=0.001s, total=5.645s
+2026-02-06 16:12:06 | INFO | RAG-Server | Completed 1/1 sub-queries successfully
+2026-02-06 16:12:06 | INFO | RAG-Server | 📝 synthesizer_node: history=0 msgs, profile=False, related_convs=0
+2026-02-06 16:12:12 | INFO | RAG-Server | [e4adeeff] 🤖 DEEP_AGENT_END | {"elapsed_sec": 38.597, "complexity": "COMPLEX", "sub_queries": 1, "response_length": 1767}
+2026-02-06 16:12:12 | INFO | RAG-Server | [e4adeeff] ⏱️ TIMING_PROFILE | {"1_components": 0.0, "2_history": 0.004, "3_graphiti_context": 0.888, "4_user_profile": 2.883, "5_topic_detection": 0.0, "6_general_handler": 3.052, "7_query_rewrite": 0.002, "8_langgraph": 31.767}
+2026-02-06 16:12:24 | INFO | RAG-Server | Response enhanced: 6 improvements made
+2026-02-06 16:12:24 | INFO | RAG-Server | [e4adeeff] 🧠 GRAPHITI_SUMMARY | {"calls": 2, "elapsed_sec": 1.702, "by_type": {"search": {"count": 2, "elapsed_sec": 1.702}}}
+INFO:     127.0.0.1:56740 - "POST /query HTTP/1.1" 200 OK
+2026-02-06 16:12:52 | INFO | RAG-Server | 💾 Saved conversation to Graphiti (group_id=test_user_123, 27.40s)
+2026-02-06 16:13:26 | INFO | RAG-Server | [b2dce199] 🤖 QUERY_START | {"query": "What about paternity leave?"}
+2026-02-06 16:13:27 | INFO | RAG-Server | 🧠 Graphiti search returned 4 facts (group_id=test_user_123)
+2026-02-06 16:13:27 | INFO | RAG-Server |   Fact 1: Assistant informed User about maternity leave entitlements in the UAE....
+2026-02-06 16:13:27 | INFO | RAG-Server |   Fact 2: User asked how to extend maternity leave in UAE....
+2026-02-06 16:13:27 | INFO | RAG-Server |   Fact 3: To extend maternity leave in the UAE, the discretion of the Local HR Department is involved an employee is using sick leave....
+2026-02-06 16:13:27 | INFO | RAG-Server | 📦 Prefetched 4 Graphiti facts for user=test_user_123
+2026-02-06 16:13:27 | INFO | RAG-Server | ⏱️ TIMING: Graphiti prefetch took 852ms, 4 facts
+2026-02-06 16:13:27 | INFO | RAG-Server | 🚀 Enhanced query with Graphiti: 4 related facts
+2026-02-06 16:13:27 | INFO | RAG-Server | 🚀 Graphiti context: profile=False, related=4
+2026-02-06 16:13:34 | INFO | RAG-Server | 👤 User profile for test_user_123: UserProfile(user_id='test_user_123', role=None, country='UAE', department=None, brand=None, employment_type=None, preferred_detail_level='medium', interaction_style='neutral', topics_discussed=[], last_updated='2026-02-06T16:11:37.689402', conversation_count=0)
+2026-02-06 16:13:37 | INFO | RAG-Server | 🔄 Topic transition: <topic_change_detector.TopicTransitionResult object at 0x7dfa9978a270>
+2026-02-06 16:13:37 | INFO | RAG-Server | 🎯 Conversation state: answering
+2026-02-06 16:13:41 | INFO | RAG-Server | Query classified as knowledge_based (confidence: 0.90): The user is asking about 'paternity leave' which is a direct follow-up to the previous discussion about 'maternity leave' and falls under HR policy questions.
+2026-02-06 16:13:41 | INFO | RAG-Server | Passing to RAG pipeline: knowledge_based (confidence: 0.90)
+2026-02-06 16:13:41 | INFO | RAG-Server | [b2dce199] 🤖 DEEP_AGENT_START | {"query": "What about paternity leave?"}
+2026-02-06 16:13:50 | INFO | RAG-Server | [b2dce199] 🔄 DEEP_QUERY_REWRITE | {"original": "What about paternity leave?", "rewritten": "What about paternity leave in UAE?"}
+2026-02-06 16:13:57 | INFO | RAG-Server | 🧠 LLM Greeting Detection: is_greeting=False, type=question (reasoning: The user is asking a direct question about paternity leave in the UAE. This is a new topic compared )
+2026-02-06 16:13:58 | INFO | RAG-Server | 📝 simple_rag_node: history=2 msgs, profile=False, related_convs=4
+2026-02-06 16:13:59 | INFO | RAG-Server | 🔍 Starting parallel Qdrant + Graphiti search for query: What about paternity leave in UAE?
+2026-02-06 16:13:59 | INFO | RAG-Server | 📦 Using cached Graphiti facts for search: 4 facts
+2026-02-06 16:13:59 | INFO | RAG-Server | ✅ Graphiti search completed: 4 facts found
+2026-02-06 16:13:59 | INFO | RAG-Server | ✅ Qdrant search completed: 10 points found
+2026-02-06 16:14:03 | INFO | RAG-Server | Applied reranking: 10 documents reranked
+2026-02-06 16:14:03 | INFO | RAG-Server | 📚 Retrieving complete documents for top 2 ranked documents in parallel
+2026-02-06 16:14:03 | INFO | RAG-Server | 📄 Loaded complete document 'HRD - GEN - 006 - Employee Leaves - P - 15.md': 9879 chars from /home/admincsp/multimodal-rag/azadea/md_out_data_multimodal/HRD - GEN - 006 - Employee Leaves - P - 15.md
+2026-02-06 16:14:03 | INFO | RAG-Server | 📄 Loaded complete document 'HRD - GEN - 004 - Maternity and Paternity Leaves - P - 13.md': 10618 chars from /home/admincsp/multimodal-rag/azadea/md_out_data_multimodal/HRD - GEN - 004 - Maternity and Paternity Leaves - P - 13.md
+2026-02-06 16:14:03 | INFO | RAG-Server | ✅ Added complete documents context: 20662 chars from 2 documents
+2026-02-06 16:14:03 | INFO | RAG-Server | ⏱️ RETRIEVAL_TIMING: embed=1.453s, parallel_search=0.014s, rerank=3.431s, complete_docs=0.001s, total=5.510s
+2026-02-06 16:14:03 | INFO | RAG-Server | 🔍 Retrieved 7 sources for query: What about paternity leave in UAE?...
+2026-02-06 16:14:03 | INFO | RAG-Server | 📊 Context size: 21109 chars from 7 sources
+2026-02-06 16:14:05 | INFO | RAG-Server | [b2dce199] 🤖 DEEP_AGENT_END | {"elapsed_sec": 38.273, "complexity": "SIMPLE", "sub_queries": 0, "response_length": 539}
+2026-02-06 16:14:05 | INFO | RAG-Server | [b2dce199] ⏱️ TIMING_PROFILE | {"1_components": 0.0, "2_history": 0.001, "3_graphiti_context": 0.852, "4_user_profile": 6.462, "5_topic_detection": 3.106, "6_general_handler": 4.209, "7_query_rewrite": 8.612, "8_langgraph": 15.03}
+2026-02-06 16:14:09 | INFO | RAG-Server | Response enhanced: 5 improvements made
+2026-02-06 16:14:09 | INFO | RAG-Server | [b2dce199] 🧠 GRAPHITI_SUMMARY | {"calls": 1, "elapsed_sec": 0.852, "by_type": {"search": {"count": 1, "elapsed_sec": 0.852}}}
+INFO:     127.0.0.1:56560 - "POST /query HTTP/1.1" 200 OK
+2026-02-06 16:14:51 | INFO | RAG-Server | 💾 Saved conversation to Graphiti (group_id=test_user_123, 42.41s)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [1999442]

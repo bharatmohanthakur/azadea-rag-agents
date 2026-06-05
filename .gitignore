@@ -1,0 +1,50 @@
+# ── Secrets / credentials (NEVER commit) ──────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+**/wallet/
+Configurations/oci/
+**/credentials*
+**/*secret*
+**/*_secret*
+
+# ── Logs / dumps (large, not source) ──────────────────────────────────
+ingestion_logs_dump/
+logs/
+*.log
+
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ── Data / generated artifacts ────────────────────────────────────────
+md_out_data*/
+*_figures.json
+*.pdf
+*.tmp
+/tmp/
+
+# ── OS / editor ───────────────────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# ── OCI CLI config + backups (contain identity / local-only) ──
+**/Configurations/
+Configurations/
+oci_config
+**/oci_config
+*.bak
+*.bak.*

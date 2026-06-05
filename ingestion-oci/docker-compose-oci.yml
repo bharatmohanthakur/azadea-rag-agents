@@ -1,0 +1,69 @@
+# ============================================================================
+# OCI Document Ingestion + RAG Stack
+#
+# Single image, two services:
+#   8074 — Ingestion (PDF → Gemini Flash → Oracle 26ai)
+#   7874 — RAG Query  (Oracle hybrid search → Gemini Flash → SSE stream)
+#
+# Usage:
+#   docker compose -f docker-compose-oci.yml up --build -d
+#   curl http://localhost:8074/health   # Ingestion
+#   curl http://localhost:7874/health   # RAG
+# ============================================================================
+
+x-common: &common
+  build: .
+  environment: &common-env
+    OCI_KEY_FILE: /app/Configurations/oci/oci_api_key.pem
+    OCI_CONFIG_FILE: /app/oci_config
+    ORACLE_WALLET_DIR: /app/wallet
+    ORACLE_WALLET_PASSWORD: ${ORACLE_WALLET_PASSWORD:?set in env}
+    ORACLE_DB_USER: ${ORACLE_DB_USER:-DS_USER}
+    ORACLE_DB_PASSWORD: ${ORACLE_DB_PASSWORD}
+    ORACLE_DB_DSN: ${ORACLE_DB_DSN:-brainshiftdb_medium}
+    OCI_COMPARTMENT_ID: ${OCI_COMPARTMENT_ID:?set in env}
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+  restart: unless-stopped
+
+services:
+  # ---------- Ingestion Service ----------
+  ingestion:
+    <<: *common
+    container_name: oci-ingestion
+    command: python service.py
+    ports:
+      - "8074:8074"
+    environment:
+      <<: *common-env
+      SERVICE_PORT: "8074"
+    volumes:
+      - ${PDF_DATA_DIR:-./data}:/app/data
+      - md_output:/app/md_output
+
+  # ---------- RAG Query Service ----------
+  rag:
+    <<: *common
+    container_name: oci-rag
+    command: python rag_server_oci.py
+    ports:
+      - "7874:7874"
+    environment:
+      <<: *common-env
+      RAG_PORT: "7874"
+      RAG_WORKERS: "${RAG_WORKERS:-4}"
+
+  # ---------- Redis (conversation state) ----------
+  redis:
+    image: redis:7-alpine
+    container_name: oci-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+
+volumes:
+  md_output:
+  redis_data:

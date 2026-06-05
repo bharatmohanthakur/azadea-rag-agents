@@ -1,0 +1,86 @@
+# ============================================================================
+# Document Ingestion — Three-Tier Docker Deployment
+#
+# Ports:
+#   8071 — Basic    (OCR only, semantic chunking, no images)
+#   8072 — Standard (OCR + GPT-4V figures, typed chunks, no LLM grouping)
+#   8073 — Premium  (OCR + GPT-4V figures + LLM page grouping)
+#
+# Usage:
+#   1. Run ./build.sh first to copy pipeline code into build contexts
+#   2. docker compose up --build
+#   3. Access Swagger docs at /docs on each port
+#
+# Each service writes to its own Qdrant collection and MD output directory.
+# ============================================================================
+
+x-common-env: &common-env
+  AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: ${AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT}
+  AZURE_DOCUMENT_INTELLIGENCE_KEY: ${AZURE_DOCUMENT_INTELLIGENCE_KEY}
+  AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT}
+  AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
+  AZURE_OPENAI_EMBED_DEPLOYMENT: ${AZURE_OPENAI_EMBED_DEPLOYMENT:-text-embedding-3-large}
+  AZURE_OPENAI_CHAT_DEPLOYMENT: ${AZURE_OPENAI_CHAT_DEPLOYMENT:-gpt-4o}
+  AOAI_VISION_DEPLOYMENT: ${AOAI_VISION_DEPLOYMENT:-gpt-4.1}
+  QDRANT_URL: ${QDRANT_URL:-http://host.docker.internal:6333}
+  QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+  S3_SERVICE_URL: ${S3_SERVICE_URL:-}
+  S3_BUCKET_NAME: ${S3_BUCKET_NAME:-}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+
+services:
+  # ---------- TIER 1: Basic ----------
+  ingestion-basic:
+    build:
+      context: ./ingestion-basic
+    container_name: ingestion-basic
+    ports:
+      - "8071:8071"
+    environment:
+      <<: *common-env
+      QDRANT_COLLECTION: docs_basic_azadea
+      SERVICE_PORT: "8071"
+    volumes:
+      - ${PDF_DATA_DIR:-/home/admincsp/multimodal-rag/azadea/data}:/app/data
+      - basic_md_output:/app/md_output
+    restart: unless-stopped
+
+  # ---------- TIER 2: Standard ----------
+  ingestion-standard:
+    build:
+      context: ./ingestion-standard
+    container_name: ingestion-standard
+    ports:
+      - "8072:8072"
+    environment:
+      <<: *common-env
+      QDRANT_COLLECTION: docs_standard_azadea
+      SERVICE_PORT: "8072"
+    volumes:
+      - ${PDF_DATA_DIR:-/home/admincsp/multimodal-rag/azadea/data}:/app/data
+      - ${IMAGES_DIR:-/home/admincsp/multimodal-rag/azadea/images}:/app/images
+      - standard_md_output:/app/md_output
+    restart: unless-stopped
+
+  # ---------- TIER 3: Premium ----------
+  ingestion-premium:
+    build:
+      context: ./ingestion-premium
+    container_name: ingestion-premium
+    ports:
+      - "8073:8073"
+    environment:
+      <<: *common-env
+      QDRANT_COLLECTION: docs_llm_chunked_azadea
+      SERVICE_PORT: "8073"
+    volumes:
+      - ${PDF_DATA_DIR:-/home/admincsp/multimodal-rag/azadea/data}:/app/data
+      - ${IMAGES_DIR:-/home/admincsp/multimodal-rag/azadea/images}:/app/images
+      - premium_md_output:/app/md_output
+    restart: unless-stopped
+
+volumes:
+  basic_md_output:
+  standard_md_output:
+  premium_md_output:

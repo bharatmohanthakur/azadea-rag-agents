@@ -1,0 +1,162 @@
+[
+  {
+    "id": 1,
+    "query": "What is the annual leave policy?",
+    "expected": "Annual Leave",
+    "status": "PASS",
+    "reason": "Match found",
+    "top_source": "HRD - GEN - 001 - Annual Leave - P - 19.md",
+    "all_sources": [
+      "HRD - GEN - 001 - Annual Leave - P - 19.md",
+      "HRD - GEN - 006 - Employee Leaves - P - 15.md",
+      "HRD - GEN - 001 - Annual Leave - P - 19.md",
+      "HRD - GEN - 006 - Employee Leaves - P - 15.md",
+      "HRD - GEN - 001 - Annual Leave - P - 19.md"
+    ],
+    "elapsed": 4.691
+  },
+  {
+    "id": 2,
+    "query": "What are the rules for employee leaves like maternity and si",
+    "expected": "Employee Leaves",
+    "status": "PASS",
+    "reason": "Match found",
+    "top_source": "HRD - GEN - 004 - Maternity and Paternity Leaves - P - 13.md",
+    "all_sources": [
+      "HRD - GEN - 004 - Maternity and Paternity Leaves - P - 13.md",
+      "HRD - GEN - 004 - Maternity and Paternity Leaves - P - 13.md",
+      "HRD - TRD - 020 - Employee Attendance Validation - G - 1.md",
+      "HRD - GEN - 004 - Maternity and Paternity Leaves - P - 13.md",
+      "HRD - GEN - 006 - Employee Leaves - P - 15.md"
+    ],
+    "elapsed": 8.356
+  },
+  {
+    "id": 3,
+    "query": "What is the dress code policy for employees?",
+    "expected": "Dress Code",
+    "status": "FAIL",
+    "reason": "Expected 'Dress Code' not in sources",
+    "top_source": "HRD - TDD - 010 - On-job FnB Onboarding Checklist -  Kitchen Commis - L10 - 2.md",
+    "all_sources": [
+      "HRD - TDD - 010 - On-job FnB Onboarding Checklist -  Kitchen Commis - L10 - 2.md",
+      "HRD - TRD - 002 - Employee Uniform - P - 16.md",
+      "HRD - GEN - 016 - Remote Working - P - 2.md",
+      "HRD - TRD - 002 - Employee Uniform - P - 16.md",
+      "HRD - TRD - 002 - Employee Uniform - W - 1.md"
+    ],
+    "elapsed": 2.225
+  },
+  {
+    "id": 4,
+    "query": "What is the policy on employee resignation and termination?",
+    "expected": "Resignation/Termination",
+    "status": "FAIL",
+    "reason": "Expected 'Resign' not in sources",
+    "top_source": "HRD - TMD - 002 - Employee Offboarding - G - 1.md",
+    "all_sources": [
+      "HRD - TMD - 002 - Employee Offboarding - G - 1.md",
+      "HRD - GEN - 010 - Employment Visa Release - P - 2.md",
+      "HRD - TMD - 002 - Employee Offboarding - W - 1.md",
+      "HRD - TMD - 002 - Employee Offboarding - G - 1.md",
+      "HRD - TMD - 002 - Employee Offboarding - G - 1.md"
+    ],
+    "elapsed": 3.571
+  },
+  {
+    "id": 5,
+    "query": "How does the probation period work?",
+    "expected": "Probation",
+    "status": "FAIL",
+    "reason": "Expected 'Probat' not in sources",
+    "top_source": "AUD - GEN - 001 - Internal Audit Manual - G - 1.md",
+    "all_sources": [
+      "AUD - GEN - 001 - Internal Audit Manual - G - 1.md",
+      "HRD - TRD - 013 - New Joiner - W - 1.md",
+      "HRD - GEN - 006 - Employee Leaves - P - 15.md",
+      "HRD - TRD - 013 - New Joiner - W - 1.md",
+      "HRD - TRD - 030 - Shop Bonus Preparation - G - 1.md"
+    ],
+    "elapsed": 2.524
+  },
+  {
+    "id": 6,
+    "query": "What is the overtime policy?",
+    "expected": "Overtime",
+    "status": "FAIL",
+    "reason": "Expected 'Overtime' not in sources",
+    "top_source": "ACC - REP - 005 - Financials Reporting - G - 1.md",
+    "all_sources": [
+      "ACC - REP - 005 - Financials Reporting - G - 1.md",
+      "HRD - GEN - 007 - Employee Attendance - P - 16.md",
+      "HRD - TRD - 008 - Compensation and Benefits of Part-timers - P - 3.md",
+      "BTR - GEN - 002 - Policy Procedure Template - P - 5.md",
+      "HRD - TRD - 030 - Shop Bonus Preparation - W - 1.md"
+    ],
+    "elapsed": 2.013
+  },
+  {
+    "id": 7,
+    "query": "What are the rules for employee transfers between countries?",
+    "expected": "Transfer",
+    "status": "PASS",
+    "reason": "Match found",
+    "top_source": "HRD - TRD - 012 - Employee Relocation - P - 16.md",
+    "all_sources": [
+      "HRD - TRD - 012 - Employee Relocation - P - 16.md",
+      "HRD - TMD - 004 - Employee Transfer - B - 5.md",
+      "HRD - TRD - 003 - Azadea Discount - W - 1.md",
+      "HRD - TMD - 004 - Employee Transfer - B - 5.md",
+      "HRD - TRD - 012 - Employee Relocation - P - 16.md"
+    ],
+    "elapsed": 1.858
+  },
+  {
+    "id": 8,
+    "query": "What is the employee grievance procedure?",
+    "expected": "Grievance",
+    "status": "PASS",
+    "reason": "Match found",
+    "top_source": "HRD - TMD - 006 - Employee Grievance - P - 3.md",
+    "all_sources": [
+      "HRD - TMD - 006 - Employee Grievance - P - 3.md",
+      "HRD - TMD - 006 - Employee Grievance - W - 2.md",
+      "HRD - TMD - 006 - Employee Grievance - P - 3.md",
+      "HRD - TMD - 006 - Employee Grievance - P - 3.md",
+      "HRD - TMD - 006 - Employee Grievance - W - 2.md"
+    ],
+    "elapsed": 4.006
+  },
+  {
+    "id": 9,
+    "query": "What is the policy on working hours and attendance?",
+    "expected": "Working Hours/Attendance",
+    "status": "FAIL",
+    "reason": "Expected 'Working Hours' not in sources",
+    "top_source": "HRD - GEN - 007 - Employee Attendance - P - 16.md",
+    "all_sources": [
+      "HRD - GEN - 007 - Employee Attendance - P - 16.md",
+      "HRD - GEN - 007 - Employee Attendance - P - 16.md",
+      "HRD - GEN - 016 - Remote Working - P - 2.md",
+      "HRD - TRD - 008 - Compensation and Benefits of Part-timers - P - 3.md",
+      "HRD - GEN - 007 - Employee Attendance - P - 16.md"
+    ],
+    "elapsed": 5.541
+  },
+  {
+    "id": 10,
+    "query": "What training and development programs are available for emp",
+    "expected": "Training/Development",
+    "status": "PASS",
+    "reason": "Match found",
+    "top_source": "HRD - TDD - 002 - Training and Development of Employees - P - 4.md",
+    "all_sources": [
+      "HRD - TDD - 002 - Training and Development of Employees - P - 4.md",
+      "HRD - TDD - 002 - Training and Development of Employees - P - 4.md",
+      "AUD - GEN - 001 - Internal Audit Manual - G - 1.md",
+      "HRD - TDD - 002 - Training and Development of Employees - P - 4.md",
+      "HRD - TDD - 002 - Training and Development of Employees - P - 4.md"
+    ],
+    "elapsed": 3.213
+  }
+]
