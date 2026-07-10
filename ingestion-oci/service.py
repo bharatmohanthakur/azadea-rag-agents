@@ -45,6 +45,12 @@ import oracle_vectordb
 import qdrant_utils
 import ingest_pipeline
 from ingest_pipeline import process_pdf_oci, ingest_md_oci
+from simple_converters import docx_to_markdown, text_to_markdown
+
+# Source formats accepted by /document. PDFs go through Gemini Document
+# Understanding; .docx/.txt/.md convert directly to Markdown (no vision needed)
+# and feed the SAME downstream chunk → embed → Qdrant path.
+SUPPORTED_EXTS = (".pdf", ".docx", ".txt", ".md")
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -115,11 +121,28 @@ _jobs: Dict[str, JobState] = {}
 _doc_locks: Dict[str, asyncio.Lock] = {}
 _background_tasks: set = set()
 
+# Global cap on concurrent ingestion jobs. Each job makes several OCI GenAI
+# calls (page grouping + Cohere embed); a large bulk POST would otherwise fan
+# out unbounded and trip OCI's tenant rate limit (429), degrading grouping to a
+# single coarse chunk. Capping at 10 keeps the corpus re-ingesting without
+# throttling — excess jobs queue (status PENDING) until a slot frees.
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
+_ingest_sem: Optional[asyncio.Semaphore] = None
+
 
 def _get_doc_lock(doc_id: str) -> asyncio.Lock:
     if doc_id not in _doc_locks:
         _doc_locks[doc_id] = asyncio.Lock()
     return _doc_locks[doc_id]
+
+
+def _get_ingest_sem() -> asyncio.Semaphore:
+    """Lazily create the concurrency semaphore inside the running event loop
+    (creating it at import time can bind it to the wrong loop)."""
+    global _ingest_sem
+    if _ingest_sem is None:
+        _ingest_sem = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+    return _ingest_sem
 
 
 def _now_iso() -> str:
@@ -198,16 +221,35 @@ class JobSubmitResponse(BaseModel):
 # HELPERS
 # ===========================================================================
 
+def _norm_stem(s: str) -> str:
+    """Normalize a filename stem for tolerant matching: unify en/em dashes to
+    hyphens, collapse whitespace runs, trim, casefold. The corpus filenames mix
+    '–' vs '-' and double/trailing spaces, so exact stem matching misses names
+    that clients send with normal hyphens/spacing."""
+    s = s.replace("–", "-").replace("—", "-")
+    s = " ".join(s.split())
+    return s.casefold()
+
+
 def find_pdf(filename: str) -> Optional[Path]:
+    """Locate a source file on disk by name, across all SUPPORTED_EXTS. Tries
+    exact stem first (preferring the requested extension), then a normalized
+    match (dash/whitespace/case tolerant) so cosmetic name differences from the
+    client don't 404."""
     stem = Path(filename).stem
     if any(c in stem for c in ("*", "?", "[", "]")):
         return None
+    want_ext = Path(filename).suffix.lower()
+    exts = ([want_ext] if want_ext in SUPPORTED_EXTS else []) + \
+           [e for e in SUPPORTED_EXTS if e != want_ext]
     try:
-        matches = list(PDF_ROOT.rglob(f"{stem}.pdf"))
-        if matches:
-            return matches[0]
-        lower = stem.lower()
-        matches = [p for p in PDF_ROOT.rglob("*.pdf") if p.stem.lower() == lower]
+        for ext in exts:
+            matches = list(PDF_ROOT.rglob(f"{stem}{ext}"))
+            if matches:
+                return matches[0]
+        want = _norm_stem(stem)
+        matches = [p for p in PDF_ROOT.rglob("*")
+                   if p.suffix.lower() in SUPPORTED_EXTS and _norm_stem(p.stem) == want]
         return matches[0] if matches else None
     except OSError:
         return None
@@ -284,6 +326,21 @@ def run_pdf_to_md(pdf_path: Path) -> Path:
     return md_path
 
 
+def run_source_to_md(src_path: Path) -> Path:
+    """Dispatch source → Markdown by file extension. PDFs use Gemini Document
+    Understanding; .docx and .txt/.md convert directly (no vision). All paths
+    write `{stem}.md` into MD_OUT_DIR and return it, so the downstream
+    chunk → embed → Qdrant step is identical regardless of input format."""
+    ext = Path(src_path).suffix.lower()
+    if ext == ".pdf":
+        return run_pdf_to_md(src_path)
+    if ext == ".docx":
+        return docx_to_markdown(src_path, MD_OUT_DIR)
+    if ext in (".txt", ".md"):
+        return text_to_markdown(src_path, MD_OUT_DIR)
+    raise ValueError(f"Unsupported source format '{ext}'. Supported: {', '.join(SUPPORTED_EXTS)}")
+
+
 def run_md_to_oracle(md_path: Path) -> int:
     """Chunk extraction + OCI LLM grouping + OCI embed → Oracle 26ai."""
     chunks = ingest_md_oci(md_path)
@@ -298,7 +355,11 @@ def run_md_to_oracle(md_path: Path) -> int:
 
 async def _execute_job(job: JobState, pdf_path: Optional[Path]):
     loop = asyncio.get_running_loop()
-    async with _get_doc_lock(job.doc_id):
+    # Global concurrency gate + per-doc lock. At most MAX_CONCURRENT_JOBS run
+    # the heavy (OCI GenAI) work at once; the rest wait here as PENDING so we
+    # never fan out enough calls to hit OCI's rate limit. Both context managers
+    # on one `async with` keeps the existing body indentation unchanged.
+    async with _get_ingest_sem(), _get_doc_lock(job.doc_id):
         try:
             job.status = JobStatus.PROCESSING
             job.started_at = _now_iso()
@@ -337,30 +398,28 @@ async def _execute_job(job: JobState, pdf_path: Optional[Path]):
                         job.error = f"S3 download failed: {e}"
                         return
 
-                if job.operation == "update":
-                    job.step = "deleting"
-                    job.progress = "Removing existing chunks..."
-                    deleted = await loop.run_in_executor(None, delete_doc_from_qdrant, job.doc_id)
-                    job.chunks_deleted = deleted
-                    await loop.run_in_executor(None, remove_md_files, job.doc_id)
-                elif job.operation == "add":
-                    job.step = "validating"
-                    existing = await loop.run_in_executor(None, count_doc_in_qdrant, job.doc_id)
-                    if existing > 0:
-                        job.status = JobStatus.FAILED
-                        job.completed_at = _now_iso()
-                        job.error = f"Already indexed with {existing} chunks. Use operation='update'."
-                        return
+                # add and update are BOTH upsert (a re-submitted doc is refreshed,
+                # not rejected). IMPORTANT: do NOT delete the old chunks here.
+                # The ingest pipeline deletes-then-upserts by doc_id atomically at
+                # the very end — AFTER MD conversion + embeddings succeed. Deleting
+                # up front would drop the old chunks even when a later step fails
+                # (grouping error, OCI throttling), which loses the document.
+                # Leaving the old chunks in place means a failed re-ingest is a
+                # no-op (the previous version survives) instead of data loss.
+                existing = await loop.run_in_executor(None, count_doc_in_qdrant, job.doc_id)
+                job.chunks_deleted = existing  # reported; the actual swap happens atomically in the pipeline
 
-                # PDF → MD (Docling + Gemini vision)
-                job.step = "pdf_to_md"
-                job.progress = "Gemini 2.5 Flash PDF → Markdown (parallel page batches)..."
+                # Source → MD. PDF uses Gemini DU; .docx/.txt/.md convert directly.
+                _ext = Path(pdf_path).suffix.lower() if pdf_path else ""
+                job.step = "source_to_md"
+                job.progress = ("Gemini 2.5 Flash PDF → Markdown (parallel page batches)..."
+                                if _ext == ".pdf" else f"Converting {_ext} → Markdown...")
                 try:
-                    md_path = await loop.run_in_executor(None, run_pdf_to_md, pdf_path)
+                    md_path = await loop.run_in_executor(None, run_source_to_md, pdf_path)
                 except Exception as e:
                     job.status = JobStatus.FAILED
                     job.completed_at = _now_iso()
-                    job.error = f"PDF→MD failed: {e}"
+                    job.error = f"source→MD failed: {e}"
                     job.recovery = f"Retry with operation='{job.operation}'."
                     return
 
@@ -407,6 +466,12 @@ async def submit_document_job(request: DocumentRequest):
     pdf_path: Optional[Path] = None
 
     if operation in ("add", "update"):
+        # Reject unsupported formats up front (only when the filename carries an
+        # extension — bare stems are resolved across all supported types below).
+        _ext = Path(filename).suffix.lower()
+        if _ext and _ext not in SUPPORTED_EXTS:
+            raise HTTPException(status_code=400,
+                detail=f"Unsupported format '{_ext}'. Supported: {', '.join(SUPPORTED_EXTS)}.")
         if file_id:
             # Fetched from the Companion download API at job time. Token optional
             # (may be unauthenticated on the internal network).
@@ -417,7 +482,9 @@ async def submit_document_job(request: DocumentRequest):
         else:
             pdf_path = find_pdf(filename)
             if pdf_path is None:
-                raise HTTPException(status_code=404, detail=f"PDF '{filename}' not found under {PDF_ROOT}.")
+                raise HTTPException(status_code=404,
+                    detail=f"Source '{filename}' not found under {PDF_ROOT} "
+                           f"(supported: {', '.join(SUPPORTED_EXTS)}).")
 
     _cleanup_expired_jobs()
     job = _create_job(operation, filename, doc_id, s3_url=s3_url, file_id=file_id)
@@ -466,7 +533,8 @@ def health():
         return {"status": "ok", "tier": TIER, "backend": "qdrant", "collection": coll,
                 "total_chunks": total,
                 "active_jobs": sum(1 for j in _jobs.values() if j.status in (JobStatus.PENDING, JobStatus.PROCESSING)),
-                "pipeline": "Gemini 2.5 Flash DU + Cohere Embed v4.0 + Qdrant (dense+sparse)"}
+                "supported_formats": list(SUPPORTED_EXTS),
+                "pipeline": "PDF→Gemini 2.5 Flash DU | DOCX/TXT→direct → Cohere Embed v4.0 → Qdrant (dense+sparse)"}
     except Exception as e:
         return {"status": "degraded", "tier": TIER, "error": str(e)}
 

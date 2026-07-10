@@ -44,11 +44,72 @@ from chunk_extractors import (
     get_table_header,
 )
 
-from gemini_converter import convert_pdf_to_markdown
+# Document-Understanding backend: DU_BACKEND=claude routes PDF→Markdown through
+# the native Anthropic API (claude_converter — no OCI tenant throttling);
+# default remains the Gemini/OCI converter. Both expose the same contract.
+if os.getenv("DU_BACKEND", "gemini").lower() == "claude":
+    from claude_converter import convert_pdf_to_markdown
+else:
+    from gemini_converter import convert_pdf_to_markdown
 from oci_pipeline import (
     embed_dense_oci,
     get_page_groupings_oci,
 )
+
+# Page-grouping backend: GROUPING_BACKEND=claude routes the topic-grouping LLM
+# call through native Anthropic (no OCI 429s — this was the throttle-degraded
+# step in bulk runs). Aliased onto the same name so call sites stay untouched.
+if os.getenv("GROUPING_BACKEND", "gemini").lower() == "claude":
+    from claude_converter import get_page_groupings_claude as get_page_groupings_oci
+
+# Split page_context chunks on markdown section headings (## / ###). Requires
+# heading-structured markdown (the Claude DU converter emits it); legacy pages
+# without headings keep the merged-group behaviour automatically.
+SECTION_CHUNKING = os.getenv("SECTION_CHUNKING", "0") == "1"
+
+# Prepend a one-line LLM-generated retrieval-context header to each
+# page_context chunk before embedding ("[Context: Employee Attendance policy —
+# defines the 'Paid Off' leave type...]"). Bridges vocabulary gaps between how
+# users search and how policies are written. Best-effort: header failures never
+# block ingestion.
+CONTEXT_HEADERS = os.getenv("CONTEXT_HEADERS", "0") == "1"
+if CONTEXT_HEADERS:
+    from claude_converter import get_section_headers_claude
+# Sections smaller than this merge into the previous section — avoids confetti
+# chunks from bare headings. Deliberately low: a one-sentence definition like
+# "Paid Off" (~90 rough tokens) must survive as its own chunk.
+SECTION_MIN_TOKENS = int(os.getenv("SECTION_MIN_TOKENS", "40"))
+
+
+def _split_sections(text: str):
+    """Split markdown into (heading, text) sections on ##/### headings.
+    Content before the first heading becomes a leading section with the page
+    header (or empty string) as its heading. Undersized sections coalesce into
+    their predecessor so we never emit heading-only fragments."""
+    lines = text.split("\n")
+    raw = []           # list of [heading, [lines]]
+    cur_head, cur = "", []
+    for ln in lines:
+        if re.match(r"^#{2,3}\s+\S", ln):
+            if cur or cur_head:
+                raw.append([cur_head, cur])
+            cur_head, cur = ln.strip(), [ln]
+        else:
+            cur.append(ln)
+    if cur or cur_head:
+        raw.append([cur_head, cur])
+
+    # materialize + coalesce small sections into the previous one
+    sections = []
+    for head, body in raw:
+        body_text = "\n".join(body).strip()
+        if not body_text:
+            continue
+        if sections and count_tokens_rough(body_text) < SECTION_MIN_TOKENS:
+            sections[-1][1] = sections[-1][1] + "\n\n" + body_text
+            continue
+        sections.append([head, body_text])
+    return [(h, t) for h, t in sections]
 import oracle_vectordb
 import qdrant_utils
 from qdrant_client import QdrantClient
@@ -75,6 +136,27 @@ def process_pdf_oci(
     return md_path, None
 
 
+_SRC_ROOT = Path(os.getenv("PDF_ROOT", "/home/admincsp/multimodal-rag/azadea/data"))
+_SRC_EXTS = (".pdf", ".docx", ".txt")
+
+
+def _original_source_name(md_path: Path) -> str:
+    """Resolve the ORIGINAL document filename (with its real extension) for a
+    converted markdown file, so chunks store 'X.pdf'/'X.docx' rather than the
+    internal 'X.md'. Resolves from disk; falls back to '<stem>.pdf'."""
+    stem = md_path.stem
+    def _norm(s): return " ".join(str(s).replace("–", "-").replace("—", "-").split()).casefold()
+    for e in _SRC_EXTS:                          # exact match first
+        hits = list(_SRC_ROOT.rglob(f"{stem}{e}"))
+        if hits:
+            return hits[0].name
+    want = _norm(stem)                            # tolerant (dash/whitespace) match
+    for p in _SRC_ROOT.rglob("*"):
+        if p.suffix.lower() in _SRC_EXTS and _norm(p.stem) == want:
+            return p.name
+    return f"{stem}.pdf"
+
+
 def ingest_md_oci(
     md_path: Path,
     idx: int = 1,
@@ -89,7 +171,7 @@ def ingest_md_oci(
     doc_meta = parse_doc_filename(md_path.name)
 
     builder = ChunkBuilder(
-        source_file=md_path.name,
+        source_file=_original_source_name(md_path),
         doc_id=md_path.stem,
         domain=doc_meta.domain,
         function=doc_meta.function,
@@ -208,7 +290,7 @@ def ingest_md_oci(
     for tbl_text, start, end in reversed(tables):
         text_clean = text_clean[:start] + " [TABLE_REMOVED] " + text_clean[end:]
 
-    # --- CHUNK TYPE 6: page_context (LLM-grouped) ---
+    # --- CHUNK TYPE 6: page_context (LLM-grouped, optionally section-split) ---
     pages = split_by_pages(text_clean)
     if not pages:
         pages = {1: text_clean}
@@ -234,18 +316,44 @@ def ingest_md_oci(
         has_notes = "# Notes:" in merged_text or "# Notes" in merged_text
         has_tables = "[TABLE_REMOVED]" in text_no_figures  # original had tables
 
-        chunk = builder.build_page_context(
-            text=merged_text,
-            page=group[0],
-            has_controls=has_controls,
-            has_notes=has_notes,
-            has_tables=has_tables,
-        )
-        payload = chunk.to_payload()
-        payload["page_group"] = group
-        payload["page_start"] = min(group)
-        payload["page_end"] = max(group)
-        all_chunks.append((merged_text, payload))
+        # Section-level splitting (SECTION_CHUNKING=1): break the merged group
+        # text on markdown section headings (## / ###, produced by the Claude DU
+        # converter) so short named definitions — e.g. a leave type defined in
+        # one sentence under "### 3.3. Others" — get their own focused chunk
+        # instead of drowning in a whole-page blob. Falls back to the single
+        # merged chunk when there are no headings (e.g. legacy Gemini markdown).
+        sections = _split_sections(merged_text) if SECTION_CHUNKING else []
+        if len(sections) <= 1:
+            # single merged chunk — treated as one section below
+            sections = [("", merged_text)]
+
+        # Contextual retrieval headers: one Claude call covers every section of
+        # this group. Empty strings on any failure → chunks ship unenriched.
+        headers = ["" for _ in sections]
+        if CONTEXT_HEADERS:
+            headers = get_section_headers_claude(md_path.stem, sections)
+
+        for s_idx, (s_heading, s_text) in enumerate(sections):
+            header = headers[s_idx] if s_idx < len(headers) else ""
+            final_text = f"[Context: {header}]\n\n{s_text}" if header else s_text
+            chunk = builder.build_page_context(
+                text=final_text,
+                page=group[0],
+                has_controls=bool(re.search(r"control\s+\d", s_text, re.I)),
+                has_notes="# Notes" in s_text,
+                has_tables=has_tables,
+            )
+            payload = chunk.to_payload()
+            payload["page_group"] = group
+            payload["page_start"] = min(group)
+            payload["page_end"] = max(group)
+            if s_heading:
+                payload["section_heading"] = s_heading
+            if len(sections) > 1:
+                payload["section_index"] = s_idx
+            if header:
+                payload["context_header"] = header
+            all_chunks.append((final_text, payload))
 
     # --- CHUNK TYPE 7: doc_summary ---
     figure_types = set()

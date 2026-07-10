@@ -1,9 +1,13 @@
 """
-Tool definitions and dispatch for the AZURE-tier tool-calling RAG agent.
+Tool definitions and dispatch for the AZURE-tier tool-calling RAG agent
+— RERANKER VARIANT.
 
-Two tools (mirror of OCI agent's tools, but Azure-backed):
-  - get_history(limit)            → recent conversation messages from Redis
-  - get_document_knowledge(query) → Qdrant hybrid (dense + sparse) search
+Identical to agent_tools_azure.py, except get_document_knowledge passes the
+hybrid-search candidates through a cross-encoder reranker (OpenRouter
+/api/v1/rerank, cohere/rerank-4-fast by default) and keeps only the top-N most
+relevant chunks. This trims the context the LLM has to read (~47% on
+over-retrieved queries in testing) — cutting input tokens/cost and sharpening
+grounding — while preserving the same JSON result shape.
 
 Reuses existing Azure infrastructure via imports — does NOT touch any running service:
   - qdrant_client + COLLECTION_NAME_V2 (docs_llm_chunked_azadea)
@@ -19,6 +23,8 @@ import os
 from collections import OrderedDict
 from typing import Any, Dict, List
 
+import requests
+
 # Reuse existing singletons (these are already initialized in rag_server_gemini)
 from qdrant_client import QdrantClient, models as qm
 from rag_server_gemini import conv_manager, openrouter_client
@@ -29,7 +35,73 @@ import azure_doc_intelligence_qdrant as rag_impl   # same alias used by rag_serv
 # when the agent suspects retrieval ambiguity, so cost stays bounded.
 CLARIFICATION_MODEL = os.getenv("CLARIFICATION_MODEL", "google/gemini-2.5-pro")
 
-logger = logging.getLogger("agent_tools_azure")
+# ── Reranker config ─────────────────────────────────────────────────────────
+# After hybrid search + neighbor expansion, score every candidate chunk against
+# the query with a cross-encoder and keep the top RERANK_TOP_N. RERANK=0 turns
+# it off (falls back to the plain hybrid result, identical to the base agent).
+RERANK = os.getenv("RERANK", "1") == "1"
+RERANK_MODEL = os.getenv("RERANK_MODEL", "cohere/rerank-4-fast")
+RERANK_TOP_N = int(os.getenv("RERANK_TOP_N", "8"))
+RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", "8"))
+# Neighbor-expanded tables are pulled precisely because they hold answer values
+# yet score low on prose similarity. Keep them out of the cut by default so the
+# reranker can shrink the prose chunks without discarding answer tables.
+RERANK_PROTECT_NEIGHBORS = os.getenv("RERANK_PROTECT_NEIGHBORS", "1") == "1"
+
+logger = logging.getLogger("agent_tools_azure_rerank")
+
+
+def _rerank_chunks(query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Reorder/trim hybrid-search candidates by query relevance via OpenRouter's
+    rerank endpoint. The document text given to the reranker is the chunk's
+    full_table when present (table answers live there), else its text. On any
+    failure we log and return the original list unchanged — retrieval must never
+    break because the reranker hiccuped."""
+    if not RERANK or len(chunks) <= 1:
+        return chunks
+
+    # Optionally hold neighbor-expanded tables aside so they survive the cut.
+    if RERANK_PROTECT_NEIGHBORS:
+        protected = [c for c in chunks if c.get("from_neighbor_expansion")]
+        candidates = [c for c in chunks if not c.get("from_neighbor_expansion")]
+    else:
+        protected, candidates = [], list(chunks)
+    if len(candidates) <= 1:
+        return chunks
+
+    docs = [(c.get("full_table") or c.get("text") or "") for c in candidates]
+    try:
+        resp = requests.post(
+            f"{str(openrouter_client.base_url).rstrip('/')}/rerank",
+            headers={"Authorization": f"Bearer {openrouter_client.api_key}",
+                     "Content-Type": "application/json"},
+            json={"model": RERANK_MODEL, "query": query, "documents": docs,
+                  "top_n": min(RERANK_TOP_N, len(docs))},
+            timeout=RERANK_TIMEOUT,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+    except Exception as e:
+        logger.warning(f"rerank failed ({e}); using hybrid order")
+        return chunks
+
+    if not results:
+        return chunks
+
+    reranked = []
+    for r in results:
+        idx = r.get("index")
+        if idx is None or idx >= len(candidates):
+            continue
+        c = dict(candidates[idx])
+        c["rerank_score"] = round(r.get("relevance_score", 0.0), 4)
+        reranked.append(c)
+
+    kept = len(reranked)
+    logger.info(f"rerank: {len(candidates)} prose candidates → kept {kept} "
+                f"(+{len(protected)} protected neighbor tables)")
+    # Reranked prose first (relevance order), then any protected neighbor tables.
+    return reranked + protected
 
 # Local Qdrant client + collection — same defaults as the running pipeline service
 QDRANT_LOCAL_URL = os.getenv("QDRANT_LOCAL_URL", "http://localhost:6333")
@@ -299,6 +371,10 @@ def _tool_get_document_knowledge(args: Dict[str, Any], user_id: str) -> str:
                 "from_neighbor_expansion": True,
             })
             table_keys_seen.add(ft)
+
+    # Rerank the combined candidate set (hybrid hits + neighbor tables) and keep
+    # only the most relevant, trimming context before it reaches the LLM.
+    chunks = _rerank_chunks(query, chunks)
 
     return json.dumps({"results": chunks}, ensure_ascii=False)
 

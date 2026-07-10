@@ -134,6 +134,28 @@ TOOL_DEFINITIONS: List[FunctionDefinition] = [
             "required": ["attributes"],
         },
     ),
+    FunctionDefinition(
+        type="FUNCTION",
+        name="list_documents",
+        description=(
+            "List ALL policy/procedure documents in a category — a complete catalog, "
+            "not a search. Use this when the user asks to 'list / share / give me all "
+            "the X policies' or 'all the documents/links related to X' (e.g. all IT "
+            "policies, all HR policies). Returns every document name in that category. "
+            "For a specific question about what a policy SAYS, use get_document_knowledge "
+            "instead."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "The policy area, e.g. 'IT', 'HR', 'Finance', 'Sales', 'F&B', 'Stock'.",
+                }
+            },
+            "required": ["category"],
+        },
+    ),
     # NOTE: get_clarification exists in _DISPATCH but is NOT registered in
     # TOOL_DEFINITIONS — the agent loop invokes it automatically server-side
     # after get_document_knowledge instead of exposing it to Flash. Flash
@@ -386,12 +408,57 @@ def _tool_get_clarification(args: Dict[str, Any], user_id: str) -> str:
         })
 
 
+# Friendly category names → the `domain` code stored on each chunk.
+_DOMAIN_ALIASES = {
+    "it": "ITD", "information technology": "ITD", "itd": "ITD",
+    "hr": "HRD", "human resources": "HRD", "hrd": "HRD",
+    "finance": "ACC", "accounting": "ACC", "acc": "ACC", "accounts": "ACC",
+    "sales": "SALES",
+    "f&b": "FNB", "food and beverage": "FNB", "food": "FNB", "fnb": "FNB",
+    "stock": "SMD", "stock management": "SMD", "smd": "SMD",
+    "operations": "OPS", "ops": "OPS",
+    "audit": "AUD", "inventory": "INV", "logistics": "LOX",
+    "absher": "ABS", "abs": "ABS", "fdr": "FDR",
+}
+
+
+def _tool_list_documents(args: Dict[str, Any], user_id: str) -> str:
+    """Return ALL document names in a category (a metadata listing, not a search).
+    Used for 'list/share all the X policies' style requests."""
+    cat = (args.get("category") or args.get("domain") or "").strip().lower()
+    code = _DOMAIN_ALIASES.get(cat, cat.upper())
+    seen = set()
+    offset = None
+    try:
+        while True:
+            res, offset = qdrant_client.scroll(
+                COLLECTION_NAME,
+                scroll_filter=qm.Filter(must=[
+                    qm.FieldCondition(key="domain", match=qm.MatchValue(value=code))
+                ]),
+                limit=1000, offset=offset,
+                with_payload=["source_file"], with_vectors=False,
+            )
+            for p in res:
+                sf = (p.payload or {}).get("source_file", "")
+                if sf:
+                    seen.add(sf[:-3] if sf.endswith(".md") else sf)
+            if offset is None:
+                break
+    except Exception as e:
+        logger.warning(f"list_documents failed: {e}")
+        return json.dumps({"category": code, "count": 0, "documents": [], "error": str(e)})
+    docs = sorted(seen)
+    return json.dumps({"category": code, "count": len(docs), "documents": docs})
+
+
 _DISPATCH = {
     "get_history": _tool_get_history,
     "get_document_knowledge": _tool_get_document_knowledge,
     "get_user_profile": _tool_get_user_profile,
     "save_user_profile": _tool_save_user_profile,
     "get_clarification": _tool_get_clarification,
+    "list_documents": _tool_list_documents,
 }
 
 

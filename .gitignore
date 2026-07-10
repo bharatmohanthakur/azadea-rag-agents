@@ -48,3 +48,4 @@ oci_config
 **/oci_config
 *.bak
 *.bak.*
+azadea_pdfs_inventory.csv

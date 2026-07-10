@@ -1,62 +1,85 @@
 #!/usr/bin/env python3
 """
-RAG Server — OCI tier (TOOL-CALLING AGENT)
+RAG Server — AZURE tier (TOOL-CALLING AGENT, port 7887)
 
-Tool-calling agent for the OCI tier. Uses OCI Generative AI (Gemini 2.5 Flash)
-for the LLM, OCI Cohere Embed v4.0 (1536-dim) for embeddings, and Qdrant
-collection `docs_oci_ingested_azadea` for hybrid (dense+sparse RRF) retrieval.
+Parallel to rag_server_llm_chunked.py (port 7867). Uses the same Qdrant collection
+(docs_llm_chunked_azadea), same Azure OpenAI embedder (text-embedding-3-large),
+same Redis conversation store. Difference: instead of a hand-coded
+classify→rewrite→retrieve→generate pipeline, this runs a tool-calling agent loop.
 
 Tools:
   - get_history(limit)             → recent conversation messages
   - get_document_knowledge(query)  → Qdrant dense+sparse hybrid (RRF fusion)
-  - get_user_profile()             → stored user attributes
-  - save_user_profile(attributes)  → persist user-disclosed attributes
 
-Endpoints (parity with rag-azure-7867 production frontend contract):
-  POST /query         — sync agent loop, JSON response
-  POST /query/stream  — SSE streaming (status / source_found / progress / token / done)
-  GET  /health        — service status
+Endpoints:
+  POST /query   — sync agent loop, returns final answer
+  GET  /health  — service status
 """
 
 import asyncio
 import json
 import logging
 import os
-import sys
 import time as time_module
 import uuid
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# Local modules
-SERVICE_DIR = Path(__file__).parent.resolve()
-if str(SERVICE_DIR) not in sys.path:
-    sys.path.insert(0, str(SERVICE_DIR))
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from oci_clients import OCI_CHAT_MODEL
-from oci_chat import oci_chat_with_tools_async
-from conversation_manager import get_conversation_manager
-from rag_utils import format_gfm_to_html
-from agent_tools import (
-    TOOL_DEFINITIONS, execute_tool, get_tool_names,
-    qdrant_client, COLLECTION_NAME,
-)
+# Reuse existing singletons — conv_manager (Redis) + HTML formatter.
+from rag_server_gemini import conv_manager, format_gfm_to_html
+# Retrieval tools + dispatch are provider-agnostic (execute_tool takes a tool
+# name + JSON args). The reranker inside agent_tools_azure_rerank keeps using
+# OpenRouter's /rerank endpoint; only the CHAT model moves to native Anthropic.
+from agent_tools_azure_rerank import TOOLS_OPENAI, execute_tool, get_tool_names, qdrant_client, COLLECTION_NAME_V2
+
+import anthropic
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger("RAG-OCI-Tools")
+logger = logging.getLogger("RAG-Azure-Anthropic")
+
+# ── Native Anthropic chat backend ────────────────────────────────────────────
+# Direct first-party Claude API (NOT OpenRouter, NOT the OpenAI-compat layer).
+# Going native is what unlocks real prompt caching — Anthropic's OpenAI-compat
+# endpoint explicitly does NOT support caching. Key comes from ANTHROPIC_API_KEY.
+anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# Native model id: dash form, no "anthropic/" prefix (that's OpenRouter's scheme).
+MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+MAX_AGENT_ITERS = int(os.getenv("AGENT_MAX_ITERS", "5"))
+REAL_STREAM = os.getenv("REAL_STREAM", "1") == "1"
+# Native prompt caching via cache_control on the system+tools prefix (bills at
+# 0.1x on hits). Sonnet 4.6's minimum cacheable prefix is 2048 tokens; the
+# static system prompt + tool schemas (~2.2K) clears it.
+PROMPT_CACHE = os.getenv("PROMPT_CACHE", "1") == "1"
+# Stream Claude's thinking as 💭 status events. Off by default for lowest TTFT;
+# enabling it requires an SDK/model that accepts the adaptive thinking param.
+STREAM_THINKING = os.getenv("STREAM_THINKING", "0") == "1"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Agent system prompt
-# ─────────────────────────────────────────────────────────────────────────────
+def _tools_anthropic():
+    """Convert the OpenAI-format tool list to native Anthropic tool schema:
+    {type:function, function:{name,description,parameters}}  →
+    {name, description, input_schema}.  execute_tool() is unchanged — it dispatches
+    on the tool name regardless of provider."""
+    out = []
+    for t in TOOLS_OPENAI:
+        fn = t.get("function", t)
+        out.append({
+            "name": fn["name"],
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+        })
+    return out
+
+
+TOOLS_ANTHROPIC = _tools_anthropic()
+
 
 AGENT_SYSTEM_PROMPT = """You are Dea — the internal knowledge assistant for Azadea Group employees.
 Your knowledge base covers Azadea policies, procedures, and SOPs across many domains
@@ -71,10 +94,11 @@ You have these tools:
   Query construction rule: pass the user's question verbatim as the query whenever
   it is already a clear, standalone question. Do not rephrase, shorten, or summarize
   it — every word in the user's phrasing affects retrieval ranking.
-  When the user's profile or the recent conversation (both visible in your system
-  prompt) reveal context that scopes the answer — who the user is, where they work,
-  what topic they have been discussing — fold that context into the retrieval query
-  so the returned chunks match THIS user's situation. Then use the same profile and
+  When the user's profile (visible in your system prompt) — or the recent
+  conversation, which you can fetch with get_history — reveals context that scopes
+  the answer — who the user is, where they work, what topic they have been
+  discussing — fold that context into the retrieval query so the returned chunks
+  match THIS user's situation. Then use the same profile and
   conversation context when interpreting retrieved content: if multiple sections of
   the policy apply differently to different categories of user, pick the section
   that fits the current user's profile, and tell them that section's answer — not
@@ -128,12 +152,6 @@ Decide what to do based on the user's message (check rules in order — first ma
 - Question you genuinely cannot interpret even with history → ask one short clarifying
   question as your reply (no tool call needed; just respond with the question).
 
-Call ONE tool at a time — never emit more than a single tool call in the same
-turn. If a message needs two actions (for example, saving a fact the user just
-disclosed AND searching the knowledge base), do the FIRST tool call now, wait
-for its result, then make the SECOND tool call on your next turn. One tool per
-turn, always — never two tool calls together.
-
 Tools are how you act in this conversation; words are how you report results.
 If your reasoning concludes that a search, lookup, save, or any other tool action
 is needed, emit the corresponding tool call in this same turn. Describing what
@@ -175,12 +193,15 @@ When you have what you need, write your final answer:
 # Agent loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-MAX_AGENT_ITERS = int(os.getenv("AGENT_MAX_ITERS", "5"))
 HISTORY_TURNS = int(os.getenv("AGENT_HISTORY_TURNS", "10"))
-# OCI thinking budget control. Accepted: NONE, MINIMAL, LOW, MEDIUM, HIGH.
-# Empty/unset → OCI default (dynamic thinking, no cap). Pro cannot truly be
-# disabled — NONE/MINIMAL both bottom out near the 128-token floor.
-OCI_REASONING_EFFORT = os.getenv("OCI_REASONING_EFFORT", "").strip() or None
+
+# In this variant conversation history is NOT pre-injected into the system prompt
+# every turn. It's fetched on demand via the get_history tool only — so the model
+# pulls prior turns when a message actually depends on them, instead of paying to
+# re-send the whole digest on every query. The user PROFILE (identity: name, role,
+# country, …) is still injected, since identity scopes almost every answer. Set
+# INJECT_HISTORY=1 to restore the always-injected behaviour of the base agent.
+INJECT_HISTORY = os.getenv("INJECT_HISTORY", "0") == "1"
 
 # Values the upstream UI sends as placeholders for "not provided" — never persist
 # these into the user profile. Case-insensitive comparison.
@@ -190,8 +211,9 @@ _USER_CONTEXT_PLACEHOLDERS = {
 
 
 def _parse_user_context(raw_query: str) -> Dict[str, str]:
-    """Parse the upstream `User Context:` block preceding the `Request:` line.
-    Returns a dict of non-placeholder attributes."""
+    """Parse the upstream `User Context:` block (Name / Username / Language /
+    Country / IsCustomer / ... : value pairs) preceding the `Request:` line.
+    Returns a dict of non-placeholder attributes ready to merge into the profile."""
     if "User Context:" not in raw_query or "Request:" not in raw_query:
         return {}
     header = raw_query.split("Request:", 1)[0]
@@ -220,34 +242,42 @@ def _sync_user_context_to_profile(raw_query: str, user_id: str, request_id: str)
     if not attrs:
         return
     try:
-        cm = get_conversation_manager()
-        existing = cm.get_user_profile(user_id) or {}
+        existing = conv_manager.get_user_profile(user_id) or {}
         new_attrs = {k: v for k, v in attrs.items() if k not in existing}
         if new_attrs:
-            cm.update_user_profile(user_id, new_attrs)
+            conv_manager.update_user_profile(user_id, new_attrs)
             logger.info(f"[{request_id}] synced UI context → profile: {new_attrs}")
     except Exception as e:
         logger.warning(f"[{request_id}] failed to sync UI context: {e}")
 
 
 def _system_prompt_with_profile(user_id: str, request_id: str) -> str:
-    """Mandatory server-side profile + recent-history injection into the system
-    prompt. The LLM sees both the user's stored attributes AND a digest of the
-    recent conversation as part of its instructions every turn — never needs to
-    call get_user_profile or get_history to know identity or context, and can
-    never claim ignorance of an attribute or prior turn that is actually stored."""
+    """Server-side profile injection into the system prompt. The LLM always sees
+    the user's stored attributes as part of its instructions — so it never has to
+    call get_user_profile to know identity and can't claim ignorance of a stored
+    attribute. Conversation history is NOT injected here unless INJECT_HISTORY=1;
+    by default the model fetches it on demand via the get_history tool."""
     try:
-        profile = get_conversation_manager().get_user_profile(user_id) or {}
+        profile = conv_manager.get_user_profile(user_id) or {}
     except Exception as e:
         logger.warning(f"[{request_id}] failed to load profile: {e}")
         profile = {}
-    try:
-        history = _load_recent_history(user_id, HISTORY_TURNS) or []
-    except Exception as e:
-        logger.warning(f"[{request_id}] failed to load history: {e}")
-        history = []
+    if INJECT_HISTORY:
+        try:
+            history = _load_recent_history(user_id, HISTORY_TURNS) or []
+        except Exception as e:
+            logger.warning(f"[{request_id}] failed to load history: {e}")
+            history = []
+    else:
+        history = []   # on-demand via get_history tool, not pre-injected
 
     blocks = []
+    # The stored profile is the ONLY authoritative source of user attributes.
+    # Two blocks are built: (1) what we have, (2) explicit "NOT ON FILE" rows
+    # for every common identity attribute that's missing. The explicit-absence
+    # list is essential — without it Pro has a strong training prior to
+    # invent plausible identities when asked. Listing each missing attribute
+    # gives Pro a structured signal to refuse.
     _COMMON_IDENTITY_KEYS = ["name", "role", "country", "brand", "department",
                               "grade", "employment_type", "employee_id", "title"]
     have = profile or {}
@@ -285,9 +315,27 @@ def _system_prompt_with_profile(user_id: str, request_id: str) -> str:
     return AGENT_SYSTEM_PROMPT + "".join(blocks)
 
 
+def _build_system_blocks(user_id: str, request_id: str) -> List[Dict[str, Any]]:
+    """Build the native-Anthropic top-level `system` parameter as content blocks.
+    The STATIC instructions are one cacheable block (cache_control: ephemeral) —
+    in render order tools → system → messages, a breakpoint on this block caches
+    the tool schemas + static prompt together (bills ~0.1x on reads). The dynamic
+    profile/history goes in a separate UNcached block (changes per user, so
+    caching it would never hit). With caching off, both ship uncached."""
+    full = _system_prompt_with_profile(user_id, request_id)
+    dynamic = full[len(AGENT_SYSTEM_PROMPT):]   # full == AGENT_SYSTEM_PROMPT + dynamic
+    static_block = {"type": "text", "text": AGENT_SYSTEM_PROMPT}
+    if PROMPT_CACHE:
+        static_block["cache_control"] = {"type": "ephemeral"}
+    blocks = [static_block]
+    if dynamic.strip():
+        blocks.append({"type": "text", "text": dynamic})
+    return blocks
+
+
 def _load_recent_history(user_id: str, limit: int) -> List[Dict[str, Any]]:
-    """Pull the last `limit` messages from Redis as plain user/assistant turns.
-    Strips the upstream User Context wrapper.
+    """Pull the last `limit` messages from Redis and shape them as plain
+    chat messages. Strips the upstream User Context wrapper.
 
     Rehydration policy: keep all user messages plus only the most recent
     assistant message. Older assistant turns are dropped to prevent the
@@ -296,7 +344,7 @@ def _load_recent_history(user_id: str, limit: int) -> List[Dict[str, Any]]:
     repeat them. The most recent assistant turn is kept so the agent can
     still resolve "you asked X, I'm answering Y" linkage."""
     try:
-        prior = get_conversation_manager().get_history(user_id, limit=limit) or []
+        prior = conv_manager.get_history(user_id, limit=limit) or []
     except Exception as e:
         logger.warning(f"history load failed for {user_id}: {e}")
         return []
@@ -311,6 +359,8 @@ def _load_recent_history(user_id: str, limit: int) -> List[Dict[str, Any]]:
         if not content:
             continue
         cleaned.append({"role": role, "content": content})
+    # Find the index of the most recent assistant message (if any) and drop
+    # all earlier assistant turns — keep all user turns intact.
     last_assistant_idx = None
     for i in range(len(cleaned) - 1, -1, -1):
         if cleaned[i]["role"] == "assistant":
@@ -326,38 +376,32 @@ def _load_recent_history(user_id: str, limit: int) -> List[Dict[str, Any]]:
     return out
 
 
-async def agent_loop(user_query: str, user_id: str, request_id: str) -> Dict[str, Any]:
-    """Run the OCI agent until it produces a final response or hits max iterations.
-    Returns: {response, tools_used, iterations, sources, timings}"""
-    # History is baked into the system prompt (via _system_prompt_with_profile),
-    # so the message list contains only the current user turn — no separate
-    # history spread. This avoids the conversational-consistency poisoning seen
-    # when prior bad assistant turns are replayed in the message list.
-    system_prompt = _system_prompt_with_profile(user_id, request_id)
+def _agent_loop_sync(user_query: str, user_id: str, request_id: str) -> Dict[str, Any]:
+    """Run the agent until it produces a final response or hits MAX_AGENT_ITERS.
+    Returns: {response, tools_used, iterations, sources, timings}
+
+    History is baked into the system prompt (via _system_prompt_with_profile),
+    so the message list contains only the current user turn — no separate
+    history spread. This avoids the conversational-consistency poisoning seen
+    when prior bad assistant turns are replayed in the message list."""
+    system_blocks = _build_system_blocks(user_id, request_id)
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_query},
     ]
     tools_used: List[Dict[str, Any]] = []
-    sources_collected: List[Dict[str, Any]] = []
+    sources_collected: List[Dict[str, Any]] = []   # surfaced from get_document_knowledge tool results
     seen_chunk_ids = set()
     timings: Dict[str, float] = {"3_retrieve": 0.0, "4_generate": 0.0}
+
+    def _call():
+        return anthropic_client.messages.create(
+            model=MODEL, system=system_blocks, messages=messages,
+            tools=TOOLS_ANTHROPIC, temperature=0.4, max_tokens=16000, timeout=120.0)
 
     for iteration in range(MAX_AGENT_ITERS):
         t0 = time_module.time()
         try:
-            result = await oci_chat_with_tools_async(
-                messages=messages,
-                tools=TOOL_DEFINITIONS,
-                model=OCI_CHAT_MODEL,
-                temperature=0.4,
-                # Gemini 2.5 Pro is a thinking model — reasoning tokens count
-                # against this budget. 16000 (was 8000) leaves more room for
-                # visible output after reasoning, mitigating the known empty-
-                # completion failure mode on the synthesis hop.
-                max_tokens=16000,
-                reasoning_effort=OCI_REASONING_EFFORT,
-            )
+            response = _call()
         except Exception as e:
             logger.exception(f"[{request_id}] LLM call failed at iter {iteration+1}: {e}")
             return {
@@ -368,32 +412,20 @@ async def agent_loop(user_query: str, user_id: str, request_id: str) -> Dict[str
 
         llm_secs = round(time_module.time() - t0, 2)
         timings["4_generate"] += llm_secs
+        content = "".join(b.text for b in response.content if b.type == "text")
+        tool_uses = [b for b in response.content if b.type == "tool_use"]
 
-        text = result.get("content", "") or ""
-        calls = result.get("tool_calls", []) or []
-
-        if not calls:
-            final = text.strip()
-            # Empty-completion guard — GENERATION ONLY. Gemini 2.5 Pro
-            # intermittently returns empty text on the final synthesis hop
-            # (thinking-budget exhaustion + a known backend bug). We re-issue
-            # ONLY this generation call (messages already carry tool results —
-            # we do NOT re-run tools or restart the iteration) up to 2x before
-            # falling back to a graceful message, so the user never sees blank.
+        if not tool_uses:
+            final = content.strip()
+            # Empty-completion guard — re-issue ONLY the generation call (messages
+            # already carry any tool results; we do NOT re-run tools) up to 2x.
             gen_retry = 0
             while not final and gen_retry < 2:
                 gen_retry += 1
                 logger.warning(f"[{request_id}] empty completion at iter {iteration+1}; generation retry {gen_retry}/2")
                 try:
-                    retry_result = await oci_chat_with_tools_async(
-                        messages=messages,
-                        tools=TOOL_DEFINITIONS,
-                        model=OCI_CHAT_MODEL,
-                        temperature=0.4,
-                        max_tokens=16000,
-                        reasoning_effort=OCI_REASONING_EFFORT,
-                    )
-                    final = (retry_result.get("content", "") or "").strip()
+                    retry_resp = _call()
+                    final = "".join(b.text for b in retry_resp.content if b.type == "text").strip()
                 except Exception as e:
                     logger.warning(f"[{request_id}] generation retry {gen_retry} failed: {e}")
                     break
@@ -405,32 +437,31 @@ async def agent_loop(user_query: str, user_id: str, request_id: str) -> Dict[str
             logger.info(f"[{request_id}] agent done at iter {iteration+1} ({llm_secs}s, {len(tools_used)} tools used)")
             return {
                 "response": final, "tools_used": tools_used,
-                "iterations": iteration + 1,
-                "sources": sources_collected, "timings": timings,
+                "iterations": iteration + 1, "sources": sources_collected, "timings": timings,
             }
 
-        # Append the assistant turn (carrying tool_calls) and execute each call
-        messages.append({"role": "assistant", "content": text or "", "tool_calls": calls})
+        # Append the assistant turn (raw content blocks — includes the tool_use blocks)
+        messages.append({"role": "assistant", "content": response.content})
 
-        for tc in calls:
-            name = tc.get("name") or ""
-            args_json = tc.get("arguments") or "{}"
-            tc_id = tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+        # Execute each tool call and collect tool_result blocks for one user turn
+        tool_results: List[Dict[str, Any]] = []
+        for tu in tool_uses:
+            name = tu.name
+            args_json = json.dumps(tu.input or {})   # Anthropic gives parsed dict; execute_tool wants JSON
             logger.info(f"[{request_id}] iter {iteration+1} → {name}({args_json[:120]})")
-
             t_tool = time_module.time()
             tool_result = execute_tool(name, args_json, user_id)
             tool_secs = time_module.time() - t_tool
-
             if name == "get_document_knowledge":
                 timings["3_retrieve"] += tool_secs
-                # Extract sources so streaming endpoint can emit source_found events
+                # Extract sources from tool result so streaming endpoint can emit source_found events
                 try:
                     parsed = json.loads(tool_result)
                     for r in (parsed.get("results", []) or []):
                         src_file = r.get("source") or ""
                         if not src_file:
                             continue
+                        # dedupe by (source_file, page) so we don't re-emit identical chunks
                         key = f"{src_file}|{r.get('page')}|{r.get('chunk_type')}"
                         if key in seen_chunk_ids:
                             continue
@@ -445,14 +476,10 @@ async def agent_loop(user_query: str, user_id: str, request_id: str) -> Dict[str
                 except Exception:
                     pass
 
-                # Server-side automatic clarification consultation, gated by the
-                # AUTO_CLARIFY env var (default OFF). When enabled, after a
-                # successful retrieval we ask Pro whether the retrieved chunks
-                # justify answering directly or whether clarifying questions
-                # should be asked first; the verdict is appended to the tool
-                # result. This is a SECOND Pro call (oci_chat_json) that adds
-                # 20-80s per retrieval — with Pro as the main model its own
-                # reasoning already covers this, so it stays off by default.
+                # Auto-clarification consult is gated by AUTO_CLARIFY env var
+                # (default off when MODEL is Pro — Pro's own reasoning already
+                # covers what the secondary consult would add, calling Pro
+                # twice is redundant). Set AUTO_CLARIFY=1 to force-enable.
                 if os.getenv("AUTO_CLARIFY", "0") == "1":
                     try:
                         t_clari = time_module.time()
@@ -481,36 +508,29 @@ async def agent_loop(user_query: str, user_id: str, request_id: str) -> Dict[str
                         logger.warning(f"[{request_id}] clarification consultation failed: {e}")
 
             tools_used.append({"name": name, "args": args_json[:200], "result_chars": len(tool_result)})
+            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": tool_result})
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc_id,
-                "content": tool_result,
-            })
+        # All tool_result blocks go back in a SINGLE user message (native format)
+        messages.append({"role": "user", "content": tool_results})
 
     logger.warning(f"[{request_id}] hit MAX_AGENT_ITERS={MAX_AGENT_ITERS}; returning best-effort")
     return {
         "response": "I'm having trouble finding the answer to that — could you rephrase or give me a bit more detail?",
-        "tools_used": tools_used,
-        "iterations": MAX_AGENT_ITERS,
+        "tools_used": tools_used, "iterations": MAX_AGENT_ITERS,
         "sources": sources_collected, "timings": timings,
     }
 
 
-def _route_for_tools(tools_used_names: List[str]) -> str:
-    """Map tool usage to a route label compatible with the production frontend."""
-    if not tools_used_names:
-        return "CONVERSATIONAL"
-    if "get_document_knowledge" in tools_used_names:
-        return "SIMPLE"
-    return "CONVERSATIONAL"
+async def agent_loop(user_query: str, user_id: str, request_id: str) -> Dict[str, Any]:
+    """Async wrapper — runs the sync agent loop in a thread to avoid blocking the event loop."""
+    return await asyncio.to_thread(_agent_loop_sync, user_query, user_id, request_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI app
 # ─────────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="OCI RAG (Tool-Calling Agent)", version="0.2.0")
+app = FastAPI(title="Azure RAG (Anthropic native + Reranker)", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -531,7 +551,7 @@ async def query_endpoint(request: QueryRequest):
     user_id = request.user_id or "default_user"
     raw_query = request.query.strip()
 
-    # Strip the upstream User Context wrapper so the agent sees just the actual user request.
+    # Strip upstream User Context wrapper so the agent sees just the actual user request
     query_text = raw_query
     if "Request:" in raw_query:
         query_text = raw_query.split("Request:", 1)[-1].lstrip("\r\n").strip()
@@ -554,19 +574,24 @@ async def query_endpoint(request: QueryRequest):
 
     # Persist to Redis (keep User Context wrapper on the user message for parity)
     try:
-        cm = get_conversation_manager()
-        cm.add_message(user_id, "user", raw_query, {"request_id": request_id, "backend": "oci-agent"})
-        cm.add_message(user_id, "assistant", final, {"request_id": request_id, "backend": "oci-agent"})
+        conv_manager.add_message(user_id, "user", raw_query, {"request_id": request_id, "backend": "azure-agent"})
+        conv_manager.add_message(user_id, "assistant", final, {"request_id": request_id, "backend": "azure-agent"})
     except Exception as e:
         logger.warning(f"[{request_id}] persistence failed: {e}")
 
     elapsed = round(time_module.time() - start, 2)
+    logger.info(f"[{request_id}] AGENT_QUERY_DONE | iters={result['iterations']} tools={len(result['tools_used'])} elapsed={elapsed}s")
+
     tools_used_names = [t["name"] for t in result.get("tools_used", [])]
-    route = _route_for_tools(tools_used_names)
+    if not tools_used_names:
+        route = "CONVERSATIONAL"
+    elif "get_document_knowledge" in tools_used_names:
+        route = "SIMPLE"
+    else:
+        route = "CONVERSATIONAL"
+
     timings = result.get("timings", {})
     timings_rounded = {k: round(v, 3) for k, v in timings.items()}
-
-    logger.info(f"[{request_id}] AGENT_QUERY_DONE | iters={result['iterations']} tools={len(tools_used_names)} elapsed={elapsed}s")
 
     return QueryResponse(
         response=format_gfm_to_html(final),
@@ -577,25 +602,135 @@ async def query_endpoint(request: QueryRequest):
             "elapsed_sec": elapsed,
             "timings": timings_rounded,
             # extras (not in production schema, but useful for observability)
-            "backend": "oci-agent",
+            "backend": "azure-agent",
             "iterations": result.get("iterations"),
             "tools_used": tools_used_names,
-            "model": OCI_CHAT_MODEL,
+            "model": MODEL,
         },
     )
 
 
+def _stream_agent_worker(query_text, user_id, request_id, loop, queue, start_time):
+    """Thread worker for REAL token streaming. Runs the tool-calling agent with
+    stream=True on every turn: tool-call turns are consumed internally (emitting
+    source_found events), and the final answer turn streams `token` events as the
+    model emits them. Pushes SSE event dicts onto `queue`; ends with a {'__final__'}
+    summary then None. Token-by-token only materialises for models that stream
+    incrementally (Claude); Gemini still bursts at the end but remains correct."""
+    def put(ev):
+        asyncio.run_coroutine_threadsafe(queue.put(ev), loop)
+    try:
+        system_blocks = _build_system_blocks(user_id, request_id)
+        messages = [{"role": "user", "content": query_text}]
+        sources, seen, tools_used = [], set(), []
+        final_text = ""
+        first_token_time = None
+        tok_in = tok_out = tok_cached = 0   # summed across every LLM call
+        _STATUS = {
+            "get_document_knowledge": "Searching the knowledge base…",
+            "get_user_profile": "Checking your profile…",
+            "save_user_profile": "Saving your details…",
+            "get_history": "Reviewing the conversation…",
+            "get_clarification": "Analysing the documents…",
+            "list_documents": "Gathering the document list…",
+        }
+        for iteration in range(MAX_AGENT_ITERS):
+            content_parts, tool_seen = [], False
+            reason_buf = ""        # accumulates thinking until a sentence/clause boundary
+            with anthropic_client.messages.stream(
+                model=MODEL, system=system_blocks, messages=messages,
+                tools=TOOLS_ANTHROPIC, temperature=0.4, max_tokens=16000) as stream:
+                for event in stream:
+                    et = event.type
+                    if et == "content_block_start":
+                        cb = event.content_block
+                        if getattr(cb, "type", None) == "tool_use":
+                            # A tool block opened → emit its status as soon as we
+                            # know the name (args still streaming). Stops further
+                            # text from this turn being treated as the answer.
+                            tool_seen = True
+                            put({"type": "status",
+                                 "message": _STATUS.get(cb.name, "Working on it…")})
+                    elif et == "content_block_delta":
+                        d = event.delta
+                        dt = getattr(d, "type", None)
+                        if dt == "text_delta" and not tool_seen:
+                            if first_token_time is None:
+                                first_token_time = round(time_module.time() - start_time, 3)
+                            content_parts.append(d.text)
+                            put({"type": "token", "text": d.text})
+                        elif dt == "thinking_delta" and STREAM_THINKING:
+                            reason_buf += getattr(d, "thinking", "") or ""
+                            if len(reason_buf) >= 60 and reason_buf[-1] in ".!?;\n":
+                                put({"type": "status", "message": "💭 " + reason_buf.strip()[:220]})
+                                reason_buf = ""
+                final_msg = stream.get_final_message()
+            # Native usage: input_tokens is the UNcached prompt; cache_read /
+            # cache_creation are separate. Report tok_in as the full prompt
+            # (comparable to OpenRouter's prompt_tokens) and tok_cached as reads.
+            u = final_msg.usage
+            cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+            cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
+            tok_in += (getattr(u, "input_tokens", 0) or 0) + cache_read + cache_write
+            tok_out += getattr(u, "output_tokens", 0) or 0
+            tok_cached += cache_read
+
+            tool_uses = [b for b in final_msg.content if b.type == "tool_use"]
+            if tool_uses:
+                messages.append({"role": "assistant", "content": final_msg.content})
+                tool_results = []
+                for tu in tool_uses:
+                    tools_used.append(tu.name)
+                    args_json = json.dumps(tu.input or {})
+                    logger.info(f"[{request_id}] iter {iteration+1} → {tu.name}({args_json[:120]})")
+                    res = execute_tool(tu.name, args_json, user_id)
+                    if tu.name == "get_document_knowledge":
+                        try:
+                            parsed = json.loads(res)
+                            for r in (parsed.get("results") or []):
+                                sf = r.get("source") or ""
+                                if not sf:
+                                    continue
+                                k = f"{sf}|{r.get('page')}|{r.get('chunk_type')}"
+                                if k in seen:
+                                    continue
+                                seen.add(k)
+                                sources.append({"source": sf, "score": r.get("score")})
+                                put({"type": "source_found", "source": sf,
+                                     "index": len(sources), "score": r.get("score") or 0})
+                        except Exception:
+                            pass
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                messages.append({"role": "user", "content": tool_results})
+                continue
+            final_text = "".join(content_parts).strip()
+            break
+        if not final_text:
+            final_text = ("I found relevant information but had trouble putting together a "
+                          "complete answer just now. Could you rephrase or narrow your question?")
+            put({"type": "token", "text": final_text})
+        put({"__final__": True, "text": final_text, "sources": sources,
+             "tools": tools_used, "ttft": first_token_time,
+             "tok_in": tok_in, "tok_out": tok_out, "tok_cached": tok_cached})
+    except Exception as e:
+        logger.exception(f"[{request_id}] stream agent failed: {e}")
+        put({"type": "error", "message": str(e)})
+    finally:
+        put(None)
+
+
 @app.post("/query/stream")
 async def query_stream_endpoint(request: QueryRequest):
-    """SSE streaming endpoint — matches production rag-oci-7874's /query/stream protocol.
-    Event types:
+    """SSE streaming endpoint — matches production rag-azure-7867's /query/stream protocol.
+    Event types (for compatibility with existing frontend):
       - status        : intermediate progress messages
       - source_found  : retrieved sources during the agent's tool calls
-      - progress      : milestone progress events (e.g. "Generating answer...")
       - token         : streamed answer text (word-at-a-time)
-      - done          : final metadata (request_id, route, sources, elapsed_sec, ttft, timings)
+      - done          : final metadata (request_id, route, sources, elapsed_sec, timings, ttft)
       - error         : error message
     """
+    from fastapi.responses import StreamingResponse
+
     async def generate():
         request_id = str(uuid.uuid4())[:8]
         start_time = time_module.time()
@@ -611,11 +746,67 @@ async def query_stream_endpoint(request: QueryRequest):
         # Pre-fill profile from upstream UI's User Context (name / language / country / etc.)
         _sync_user_context_to_profile(raw_query, user_id, request_id)
 
-        # opening status
+        # opening status — matches production
         yield f"data: {json.dumps({'type': 'status', 'message': 'Processing query...'})}\n\n"
 
+        # ── REAL streaming path ──────────────────────────────────────────────
+        # Stream every agent turn; consume tool turns internally and stream the
+        # final answer token-by-token as the model emits it. Falls back to the
+        # legacy chunk-after-complete path when REAL_STREAM=0.
+        if REAL_STREAM:
+            import threading
+            queue: asyncio.Queue = asyncio.Queue()
+            run_loop = asyncio.get_running_loop()
+            threading.Thread(
+                target=_stream_agent_worker,
+                args=(query_text, user_id, request_id, run_loop, queue, start_time),
+                daemon=True,
+            ).start()
+            final_text, sources, tools_used_names, ttft = "", [], [], None
+            tok_in = tok_out = tok_cached = 0
+            progress_sent = False
+            while True:
+                ev = await queue.get()
+                if ev is None:
+                    break
+                if ev.get("__final__"):
+                    final_text = ev.get("text", "")
+                    sources = ev.get("sources", [])
+                    tools_used_names = ev.get("tools", [])
+                    ttft = ev.get("ttft")
+                    tok_in = ev.get("tok_in", 0)
+                    tok_out = ev.get("tok_out", 0)
+                    tok_cached = ev.get("tok_cached", 0)
+                    continue
+                if ev.get("type") == "error":
+                    yield f"data: {json.dumps(ev)}\n\n"
+                    return
+                # emit the 'progress' milestone once, right before the first token
+                # (preserves the legacy event sequence the frontend expects)
+                if ev.get("type") == "token" and not progress_sent:
+                    progress_sent = True
+                    yield f"data: {json.dumps({'type': 'progress', 'percentage': 60, 'message': 'Generating answer...'})}\n\n"
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+            try:
+                conv_manager.add_message(user_id, "user", raw_query, {"request_id": request_id, "backend": "azure-agent"})
+                conv_manager.add_message(user_id, "assistant", final_text, {"request_id": request_id, "backend": "azure-agent"})
+            except Exception as e:
+                logger.warning(f"[{request_id}] persistence failed: {e}")
+            elapsed = round(time_module.time() - start_time, 3)
+            route = "SIMPLE" if "get_document_knowledge" in tools_used_names else "CONVERSATIONAL"
+            done_metadata = {
+                "request_id": request_id, "route": route, "sources": sources[:5],
+                "elapsed_sec": elapsed, "ttft": ttft, "timings": {},
+                "tokens_in": tok_in, "tokens_out": tok_out, "tokens_cached": tok_cached,
+            }
+            yield f"data: {json.dumps({'type': 'done', 'metadata': done_metadata})}\n\n"
+            logger.info(f"[{request_id}] STREAM_V2_COMPLETE | tools={tools_used_names} "
+                        f"elapsed={elapsed}s ttft={ttft} tokens_in={tok_in} tokens_out={tok_out} tokens_cached={tok_cached}")
+            return
+        # ── legacy chunk-after-complete path (REAL_STREAM=0) ─────────────────
+
         try:
-            result = await agent_loop(query_text, user_id, request_id)
+            result = await asyncio.to_thread(_agent_loop_sync, query_text, user_id, request_id)
         except Exception as e:
             logger.exception(f"[{request_id}] agent_loop failed: {e}")
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
@@ -629,20 +820,27 @@ async def query_stream_endpoint(request: QueryRequest):
         sources = result.get("sources", []) or []
         timings = result.get("timings", {}) or {}
         tools_used_names = [t["name"] for t in result.get("tools_used", [])]
-        route = _route_for_tools(tools_used_names)
 
-        # source_found events — match production frontend
+        # Map tool usage to a route label compatible with production frontend
+        if not tools_used_names:
+            route = "CONVERSATIONAL"
+        elif "get_document_knowledge" in tools_used_names:
+            route = "SIMPLE"
+        else:
+            route = "CONVERSATIONAL"
+
+        # source_found events for sources used during retrieval — matches production
         for idx, src in enumerate(sources[:5], 1):
             yield f"data: {json.dumps({'type': 'source_found', 'source': src.get('source', ''), 'index': idx, 'score': src.get('score', 0) or 0})}\n\n"
 
-        # progress milestone before generation tokens
+        # progress milestone before generation tokens — matches production sequence
         if route == "SIMPLE":
             yield f"data: {json.dumps({'type': 'progress', 'percentage': 60, 'message': 'Generating answer...'})}\n\n"
 
-        # Stream the final answer in markdown-preserving chunks. We hold whitespace
-        # runs (\n\n, list indentation, code spans) intact by grouping `\S+\s*`
-        # segments — splitting plainly on whitespace would erase formatting and
-        # the frontend would render a wall of text.
+        # Stream the answer in markdown-preserving chunks. We hold whitespace runs
+        # (including \n\n, list indentation, code spans) intact by grouping
+        # `\S+\s*` segments — splitting plainly on whitespace would erase all
+        # formatting and the frontend would render a wall of text.
         import re as _re
         segments = _re.findall(r'\S+\s*', final_text)
         CHUNK_WORDS = 10
@@ -655,9 +853,8 @@ async def query_stream_endpoint(request: QueryRequest):
 
         # Persist conversation
         try:
-            cm = get_conversation_manager()
-            cm.add_message(user_id, "user", raw_query, {"request_id": request_id, "backend": "oci-agent"})
-            cm.add_message(user_id, "assistant", final_text, {"request_id": request_id, "backend": "oci-agent"})
+            conv_manager.add_message(user_id, "user", raw_query, {"request_id": request_id, "backend": "azure-agent"})
+            conv_manager.add_message(user_id, "assistant", final_text, {"request_id": request_id, "backend": "azure-agent"})
         except Exception as e:
             logger.warning(f"[{request_id}] persistence failed: {e}")
 
@@ -682,14 +879,14 @@ async def query_stream_endpoint(request: QueryRequest):
 @app.get("/health")
 def health():
     try:
-        info = qdrant_client.get_collection(COLLECTION_NAME)
+        info = qdrant_client.get_collection(COLLECTION_NAME_V2)
         return {
             "status": "ok",
-            "service": "rag-oci-tools",
-            "model": OCI_CHAT_MODEL,
+            "service": "rag-azure-tools",
+            "model": MODEL,
             "tools": get_tool_names(),
             "max_iters": MAX_AGENT_ITERS,
-            "qdrant_collection": COLLECTION_NAME,
+            "qdrant_collection": COLLECTION_NAME_V2,
             "qdrant_points": info.points_count,
         }
     except Exception as e:
@@ -698,10 +895,10 @@ def health():
 
 @app.get("/")
 def root():
-    return {"service": "rag-oci-tools", "endpoints": ["/query", "/query/stream", "/health"]}
+    return {"service": "rag-azure-tools", "endpoints": ["/query", "/health"]}
 
 
 if __name__ == "__main__":
     import uvicorn
-    PORT = int(os.getenv("SERVICE_PORT", "7884"))
+    PORT = int(os.getenv("SERVICE_PORT", "7969"))   # native-Anthropic variant — distinct from 7867/7998
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

@@ -50,11 +50,21 @@ MAX_AGENT_ITERS = int(os.getenv("AGENT_MAX_ITERS", "5"))
 REAL_STREAM = os.getenv("REAL_STREAM", "1") == "1"
 
 
+# Stream the model's reasoning (Claude exposes it via delta.reasoning; Gemini
+# does not). When on, we request low-effort thinking and surface it to the user
+# as `status` events during processing — no new event type, no frontend change.
+STREAM_THINKING = os.getenv("STREAM_THINKING", "1") == "1"
+
+
 def _reasoning_extra_body() -> Dict[str, Any]:
-    """reasoning.effort=low only for Gemini (bounds its thinking budget). Claude
-    streams best WITHOUT a forced reasoning budget, so we omit it for non-Gemini
-    models — sending it would trigger extended thinking and delay first token."""
-    return {"reasoning": {"effort": "low"}} if MODEL.startswith("google/") else {}
+    """reasoning.effort=low for Gemini (bounds its thinking budget). For Claude,
+    enable low-effort thinking only when STREAM_THINKING is on (so we can stream
+    delta.reasoning); otherwise omit it to keep first-token latency minimal."""
+    if MODEL.startswith("google/"):
+        return {"reasoning": {"effort": "low"}}
+    if STREAM_THINKING:
+        return {"reasoning": {"effort": "low"}}
+    return {}
 
 
 AGENT_SYSTEM_PROMPT = """You are Dea — the internal knowledge assistant for Azadea Group employees.
@@ -78,6 +88,11 @@ You have these tools:
   the policy apply differently to different categories of user, pick the section
   that fits the current user's profile, and tell them that section's answer — not
   a generic enumeration of all categories.
+- list_documents(category) — list ALL documents in a policy area (a complete
+  catalog, not a search). Use this when the user asks to "list / share / give me
+  all the X policies" or "all the documents/links related to X" (e.g. all IT
+  policies, all HR policies). For a question about what a specific policy SAYS,
+  use get_document_knowledge instead.
 - get_user_profile() — retrieve the user's stored attributes (role, country, brand,
   department, etc.). Call this before answering any question whose answer might
   depend on the user's role/country/brand so you can personalise rather than ask.
@@ -274,6 +289,31 @@ def _system_prompt_with_profile(user_id: str, request_id: str) -> str:
     return AGENT_SYSTEM_PROMPT + "".join(blocks)
 
 
+# Prompt caching (Claude via OpenRouter). The STATIC instructions are sent as a
+# cacheable content block (cache_control) so they bill at ~10% on reads; the
+# per-user profile/history go in a separate UNcached block (they change per user,
+# so caching them would break the cache key). Gemini doesn't support this — skip.
+PROMPT_CACHE = os.getenv("PROMPT_CACHE", "1") == "1"
+
+
+def _build_system_message(user_id: str, request_id: str) -> Dict[str, Any]:
+    """Build the system message. With caching on (and a Claude model), the static
+    base prompt is a cacheable block and the dynamic profile/history is a separate
+    uncached block. Otherwise a plain string (current behaviour)."""
+    full = _system_prompt_with_profile(user_id, request_id)
+    dynamic = full[len(AGENT_SYSTEM_PROMPT):]   # full == AGENT_SYSTEM_PROMPT + dynamic
+    if PROMPT_CACHE and not MODEL.startswith("google/"):
+        return {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": AGENT_SYSTEM_PROMPT,
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": dynamic},
+            ],
+        }
+    return {"role": "system", "content": full}
+
+
 def _load_recent_history(user_id: str, limit: int) -> List[Dict[str, Any]]:
     """Pull the last `limit` messages from Redis and shape them as plain
     chat messages. Strips the upstream User Context wrapper.
@@ -325,9 +365,8 @@ def _agent_loop_sync(user_query: str, user_id: str, request_id: str) -> Dict[str
     so the message list contains only the current user turn — no separate
     history spread. This avoids the conversational-consistency poisoning seen
     when prior bad assistant turns are replayed in the message list."""
-    system_prompt = _system_prompt_with_profile(user_id, request_id)
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
+        _build_system_message(user_id, request_id),
         {"role": "user", "content": user_query},
     ]
     tools_used: List[Dict[str, Any]] = []
@@ -592,21 +631,42 @@ def _stream_agent_worker(query_text, user_id, request_id, loop, queue, start_tim
     def put(ev):
         asyncio.run_coroutine_threadsafe(queue.put(ev), loop)
     try:
-        system_prompt = _system_prompt_with_profile(user_id, request_id)
-        messages = [{"role": "system", "content": system_prompt},
+        messages = [_build_system_message(user_id, request_id),
                     {"role": "user", "content": query_text}]
         sources, seen, tools_used = [], set(), []
         final_text = ""
         first_token_time = None
+        tok_in = tok_out = tok_cached = 0   # summed across every LLM call
         for iteration in range(MAX_AGENT_ITERS):
             stream = openrouter_client.chat.completions.create(
                 model=MODEL, messages=messages, tools=TOOLS_OPENAI, temperature=0.4,
-                max_tokens=16000, stream=True, extra_body=_reasoning_extra_body(), timeout=120.0)
+                max_tokens=16000, stream=True, extra_body=_reasoning_extra_body(),
+                stream_options={"include_usage": True}, timeout=120.0)
             content_parts, tcs, tool_seen = [], {}, False
+            reason_buf = ""        # accumulates reasoning until a sentence/clause boundary
             for chunk in stream:
+                # usage arrives on the final chunk (include_usage) — sum it
+                u = getattr(chunk, "usage", None)
+                if u:
+                    tok_in += getattr(u, "prompt_tokens", 0) or 0
+                    tok_out += getattr(u, "completion_tokens", 0) or 0
+                    ptd = getattr(u, "prompt_tokens_details", None)
+                    if ptd is not None:
+                        tok_cached += (getattr(ptd, "cached_tokens", 0)
+                                       if not isinstance(ptd, dict)
+                                       else ptd.get("cached_tokens", 0)) or 0
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
+                # Stream the model's THINKING via `status` events (no new event
+                # type → no frontend change). Flush on sentence/clause boundaries
+                # so the status line updates readably instead of per-token flicker.
+                rd = getattr(delta, "reasoning", None)
+                if rd:
+                    reason_buf += rd
+                    if len(reason_buf) >= 60 and reason_buf[-1] in ".!?;\n":
+                        put({"type": "status", "message": "💭 " + reason_buf.strip()[:220]})
+                        reason_buf = ""
                 dtc = getattr(delta, "tool_calls", None)
                 if dtc:
                     tool_seen = True
@@ -634,6 +694,17 @@ def _stream_agent_worker(query_text, user_id, request_id, loop, queue, start_tim
                 for a in tcs.values():
                     tools_used.append(a["name"])
                     logger.info(f"[{request_id}] iter {iteration+1} → {a['name']}({(a['args'] or '')[:120]})")
+                    # Stream a live status for this processing step so the user
+                    # sees activity during the otherwise-silent tool/retrieval
+                    # phase (instead of a static spinner).
+                    _status = {
+                        "get_document_knowledge": "Searching the knowledge base…",
+                        "get_user_profile": "Checking your profile…",
+                        "save_user_profile": "Saving your details…",
+                        "get_history": "Reviewing the conversation…",
+                        "get_clarification": "Analysing the documents…",
+                    }.get(a["name"], "Working on it…")
+                    put({"type": "status", "message": _status})
                     res = execute_tool(a["name"], a["args"] or "{}", user_id)
                     if a["name"] == "get_document_knowledge":
                         try:
@@ -660,7 +731,8 @@ def _stream_agent_worker(query_text, user_id, request_id, loop, queue, start_tim
                           "complete answer just now. Could you rephrase or narrow your question?")
             put({"type": "token", "text": final_text})
         put({"__final__": True, "text": final_text, "sources": sources,
-             "tools": tools_used, "ttft": first_token_time})
+             "tools": tools_used, "ttft": first_token_time,
+             "tok_in": tok_in, "tok_out": tok_out, "tok_cached": tok_cached})
     except Exception as e:
         logger.exception(f"[{request_id}] stream agent failed: {e}")
         put({"type": "error", "message": str(e)})
@@ -712,6 +784,7 @@ async def query_stream_endpoint(request: QueryRequest):
                 daemon=True,
             ).start()
             final_text, sources, tools_used_names, ttft = "", [], [], None
+            tok_in = tok_out = tok_cached = 0
             progress_sent = False
             while True:
                 ev = await queue.get()
@@ -722,6 +795,9 @@ async def query_stream_endpoint(request: QueryRequest):
                     sources = ev.get("sources", [])
                     tools_used_names = ev.get("tools", [])
                     ttft = ev.get("ttft")
+                    tok_in = ev.get("tok_in", 0)
+                    tok_out = ev.get("tok_out", 0)
+                    tok_cached = ev.get("tok_cached", 0)
                     continue
                 if ev.get("type") == "error":
                     yield f"data: {json.dumps(ev)}\n\n"
@@ -742,9 +818,11 @@ async def query_stream_endpoint(request: QueryRequest):
             done_metadata = {
                 "request_id": request_id, "route": route, "sources": sources[:5],
                 "elapsed_sec": elapsed, "ttft": ttft, "timings": {},
+                "tokens_in": tok_in, "tokens_out": tok_out, "tokens_cached": tok_cached,
             }
             yield f"data: {json.dumps({'type': 'done', 'metadata': done_metadata})}\n\n"
-            logger.info(f"[{request_id}] STREAM_V2_COMPLETE | tools={tools_used_names} elapsed={elapsed}s ttft={ttft}")
+            logger.info(f"[{request_id}] STREAM_V2_COMPLETE | tools={tools_used_names} "
+                        f"elapsed={elapsed}s ttft={ttft} tokens_in={tok_in} tokens_out={tok_out} tokens_cached={tok_cached}")
             return
         # ── legacy chunk-after-complete path (REAL_STREAM=0) ─────────────────
 
